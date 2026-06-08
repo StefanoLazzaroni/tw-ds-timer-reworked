@@ -1,0 +1,1 @@
+npx --yes terser index.refactored.js -o index.refactored.min.js -c -m
