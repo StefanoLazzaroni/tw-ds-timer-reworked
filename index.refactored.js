@@ -16,8 +16,8 @@ var millisReference;
 /** When the displayed second last changed */
 var changeMillis;
 
-/** Last tick processed by the timer loop (throttles canvas redraw) */
-var lastChange;
+/** Active timeout for restoring widget background after a flash */
+var flashTimeout;
 
 /** Active interval for the main timer loop (every 2 ms) */
 var timerInterval;
@@ -27,9 +27,6 @@ var startupInterval;
 
 /** Text value of the arrival time shown on the page (e.g. "12:34:56") */
 var lastArrival;
-
-/** First canvas iteration: draw the arc from the start of the second */
-var first = true;
 
 /** True when the UI second just changed and we are waiting for hit+offset ms */
 var changed = false;
@@ -43,13 +40,8 @@ var worldNr = game_data.world;
 
 var COOKIE_EXPIRY_DAYS = 31 * 6; // ~6 months
 var TIMER_TICK_MS = 2;
-var CANVAS_SIZE = 160;
-var CANVAS_CENTER = 75;
-var CANVAS_RADIUS = 50;
-/** Starting angle of the arc on the canvas (radians, ~-92°) */
-var CIRCLE_REFERENCE = -1.6;
-/** Conversion factor ms → radians for a full revolution (1000 ms = 628 ≈ 2π×100) */
-var MS_TO_RADIANS = 628 / 100000;
+var FLASH_DURATION_MS = 150;
+var WIDGET_DEFAULT_BG = 'transparent';
 
 // ---------------------------------------------------------------------------
 // Startup: context checks and overlay
@@ -81,7 +73,7 @@ $("#ds_body").before(
 );
 
 // ---------------------------------------------------------------------------
-// Main timer loop (canvas drawing + second-change detection)
+// Main timer loop (second-change detection + flash feedback)
 // ---------------------------------------------------------------------------
 
 function timer() {
@@ -93,26 +85,24 @@ function timer() {
 		$("#second_display")[0].innerHTML = arrival.split(":")[2];
 		changeMillis = now;
 		changed = true;
+		flashOnSecondChange(arrival);
 	}
 
 	// hit(ms) + offset(ms) elapsed since second change → reset and start new cycle
 	var hitThreshold =
 		Number($("#hit_input")[0].value) + Number($("#offset_input")[0].value);
 	if (now - changeMillis >= hitThreshold && changed == true) {
+		if (parseRemainingSeconds(arrival) === 0) {
+			flashWidget('green');
+		}
 		changed = false;
 		resetTimer(arrival, false);
 		return;
 	}
-
-	// Draw the arc on the canvas at most every ~5 ms to avoid overloading
-	if (now - 5 > lastChange) {
-		startCanvas(lastChange - millisReference, now - millisReference);
-		lastChange = now;
-	}
 }
 
 // ---------------------------------------------------------------------------
-// Timer reset: clear canvas and restart the appropriate loop
+// Timer reset: restore widget and restart the appropriate loop
 // ---------------------------------------------------------------------------
 
 /**
@@ -123,17 +113,12 @@ function resetTimer(arrival, start) {
 	clearInterval(timerInterval);
 	lastArrival = arrival;
 
-	var now = new Date().getTime();
-	millisReference = now;
-	lastChange = now;
-	first = true;
+	millisReference = new Date().getTime();
+	resetWidgetBackground();
 
 	if (start) {
 		startupInterval = setInterval(startupTimer, TIMER_TICK_MS);
 	} else {
-		var canvas = document.getElementById("millis_canvas");
-		var ctx = canvas.getContext("2d");
-		ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 		timerInterval = setInterval(timer, TIMER_TICK_MS);
 	}
 }
@@ -150,6 +135,7 @@ function startupTimer() {
 		changed = true;
 		$("#second_display")[0].innerHTML = arrival.split(":")[2];
 		changeMillis = now;
+		flashOnSecondChange(arrival);
 	}
 
 	var hitThreshold =
@@ -161,36 +147,36 @@ function startupTimer() {
 }
 
 // ---------------------------------------------------------------------------
-// UI construction: canvas, Try button, hit/offset inputs, miss display
+// UI construction: flash widget, Try button, hit/offset inputs, miss display
 // ---------------------------------------------------------------------------
 
 function addTimer() {
 	try {
 		var tableBody = $('#date_arrival').parent().parent()[0];
 		var lastRow = tableBody.children[tableBody.children.length - 1];
-		var cookieNames = [worldNr + '_hitMs', worldNr + '_offsetMs'];
+		var cookieNames = [worldNr + '_hitMs', worldNr + '_offsetMs', worldNr + '_targetArrival'];
 
 		// Widen the first header cell to make room for the new columns
 		tableBody.children[0].children[0].setAttribute(
 			'colspan',
-			Number($('[colspan]', tableBody).attr('colspan')[0]) + 4
+			Number($('[colspan]', tableBody).attr('colspan')[0]) + 5
 		);
 
-		// --- Circular canvas + current second number ---
-		var canvasTd = createElement('TD', {
+		// --- Flash widget + current second number ---
+		var widgetTd = createElement('TD', {
 			rowspan: tableBody.children.length - 2,
 			colspan: 4
 		});
-		var canvas = createElement('CANVAS', {
-			id: 'millis_canvas',
-			style: 'height:150px;width:150px'
+		var widget = createElement('DIV', {
+			id: 'millis_widget',
+			style: 'position:relative;height:150px;width:150px;background-color:transparent'
 		});
 		var secondDisplay = createElement('H2', {
 			id: 'second_display',
 			style: 'position:relative;bottom:105px;left:62px'
 		});
-		canvasTd.appendChild(canvas);
-		canvasTd.appendChild(secondDisplay);
+		widgetTd.appendChild(widget);
+		widgetTd.appendChild(secondDisplay);
 
 		// --- Try / Reset button to simulate submission ---
 		var practiceButton = createElement('BUTTON', {
@@ -204,6 +190,21 @@ function addTimer() {
 		practiceButton.innerHTML = 'Try';
 		var pbTd = createElement('TD', { style: 'width:60px' });
 		pbTd.appendChild(practiceButton);
+
+		// --- Input: target arrival time (HH:MM:SS) ---
+		var targetDefault = getCookie(cookieNames[2]) || '';
+		var targetInput = createElement('INPUT', {
+			type: 'text',
+			id: 'target_arrival_input',
+			title: 'Target arrival time (HH:MM:SS)',
+			value: targetDefault,
+			placeholder: '19:33:11',
+			onchange: 'setCookies()',
+			style: 'width:55px'
+		});
+		var targetTd = createElement('TD', { style: 'width:130px' });
+		targetTd.appendChild(document.createTextNode('Arrival:'));
+		targetTd.appendChild(targetInput);
 
 		// --- Input: target millisecond within the second ---
 		var hitDefault = getCookie(cookieNames[0]) || 0;
@@ -240,8 +241,9 @@ function addTimer() {
 		missTd.appendChild(missSpan);
 
 		// Insert into the rally point table DOM
-		$('.village_anchor').parent().parent()[0].appendChild(canvasTd);
+		$('.village_anchor').parent().parent()[0].appendChild(widgetTd);
 		lastRow.appendChild(pbTd);
+		lastRow.appendChild(targetTd);
 		lastRow.appendChild(hitTd);
 		lastRow.appendChild(offsetTd);
 		lastRow.appendChild(missTd);
@@ -290,27 +292,75 @@ function practiceFunction() {
 }
 
 // ---------------------------------------------------------------------------
-// Drawing: arc on the canvas representing elapsed time within the second
+// Flash widget: background color feedback by seconds remaining
 // ---------------------------------------------------------------------------
 
-function startCanvas(lastMillis, currentMillis) {
-	var canvas = document.getElementById("millis_canvas");
-	var ctx = canvas.getContext("2d");
-
-	if (first) {
-		first = false;
-		lastMillis = 0;
+/**
+ * @param {string} currentArrival - Current time from .relative_time (HH:MM:SS)
+ * @returns {number} Seconds remaining until target arrival, or -1 if target not set
+ */
+function parseRemainingSeconds(currentArrival) {
+	var targetStr = $("#target_arrival_input")[0].value.trim();
+	if (!targetStr) {
+		return -1;
 	}
 
-	ctx.beginPath();
-	ctx.arc(
-		CANVAS_CENTER,
-		CANVAS_CENTER,
-		CANVAS_RADIUS,
-		CIRCLE_REFERENCE + lastMillis * MS_TO_RADIANS,
-		CIRCLE_REFERENCE + currentMillis * MS_TO_RADIANS
-	);
-	ctx.stroke();
+	var targetParts = targetStr.split(":");
+	var currentParts = currentArrival.split(":");
+
+	if (targetParts.length < 3 || currentParts.length < 3) {
+		return -1;
+	}
+
+	var targetSec =
+		Number(targetParts[0]) * 3600 +
+		Number(targetParts[1]) * 60 +
+		Number(targetParts[2]);
+	var currentSec =
+		Number(currentParts[0]) * 3600 +
+		Number(currentParts[1]) * 60 +
+		Number(currentParts[2]);
+
+	return targetSec - currentSec;
+}
+
+/** Flash red/orange on second change based on seconds until target arrival */
+function flashOnSecondChange(arrival) {
+	var remaining = parseRemainingSeconds(arrival);
+	if (remaining >= 10) {
+		flashWidget('red');
+	} else if (remaining >= 1) {
+		flashWidget('orange');
+	}
+}
+
+/** @param {string} color - CSS color for the flash */
+function flashWidget(color) {
+	var widget = document.getElementById("millis_widget");
+	if (!widget) {
+		return;
+	}
+	if (flashTimeout) {
+		clearTimeout(flashTimeout);
+		flashTimeout = null;
+	}
+	widget.style.backgroundColor = color;
+	flashTimeout = setTimeout(function() {
+		widget.style.backgroundColor = WIDGET_DEFAULT_BG;
+		flashTimeout = null;
+	}, FLASH_DURATION_MS);
+}
+
+function resetWidgetBackground() {
+	var widget = document.getElementById("millis_widget");
+	if (!widget) {
+		return;
+	}
+	if (flashTimeout) {
+		clearTimeout(flashTimeout);
+		flashTimeout = null;
+	}
+	widget.style.backgroundColor = WIDGET_DEFAULT_BG;
 }
 
 // ---------------------------------------------------------------------------
@@ -322,11 +372,16 @@ function setCookies() {
 	expiry.setTime(expiry.getTime() + COOKIE_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 	var expires = 'expires=' + expiry.toUTCString();
 
-	var names = [worldNr + '_hitMs', worldNr + '_offsetMs'];
-	var values = [$("#hit_input")[0].value, $("#offset_input")[0].value];
+	var names = [worldNr + '_hitMs', worldNr + '_offsetMs', worldNr + '_targetArrival'];
+	var values = [
+		$("#hit_input")[0].value,
+		$("#offset_input")[0].value,
+		$("#target_arrival_input")[0].value
+	];
 
 	document.cookie = names[0] + '=' + values[0] + ';' + expires + ';';
 	document.cookie = names[1] + '=' + values[1] + ';' + expires + ';';
+	document.cookie = names[2] + '=' + values[2] + ';' + expires + ';';
 }
 
 function getCookie(name) {
